@@ -1,9 +1,17 @@
 # RX 9070 XT local observations (2026-11-27)
 
 Machine: Ryzen 7 9700X, RX 9070 XT 16 GB, 24 GB RAM, Windows 11,
-display driver 32.0.32029.2010. Diagnostic build, Series S, ray-tracing
+display driver 32.0.32029.2010. The earlier measurements below used a
+diagnostic build and Series S, ray-tracing
 builder off, renderer ports CONSTANTS, DESCRIPTORS, CBV, GUARD and JOURNAL
 on. Shader and previously used pipeline caches were warm.
+
+The current local preset uses Series X and a 60 FPS target at the user's
+request. A native startup confirmed 3840x2160 presentation and all three
+60 FPS timing patches, including simulation timing. Title reconstruction
+is retained; the default 2/3 scale implies roughly 2560x1440 internal
+rendering, rather than native 4K. The original Series S comparisons below
+do not establish performance or memory use for this higher-quality mode.
 
 ## Retained settings
 
@@ -12,6 +20,8 @@ $env:VICTORY_WINDOWS_BAR_MB = '3072'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '128'
 $env:VICTORY_CARD_BUFFERS_MB = '1536'
 $env:VICTORY_STAGING_BLOCK_MB = '16'
+$env:VICTORY_SEND_SPARE_MB = '256'
+$env:VICTORY_FRAME_INTERVAL_MS = '16.667'
 $env:VICTORY_UPSCALER = '6'
 $env:VICTORY_RESIDENCY = '1'
 ```
@@ -224,3 +234,14 @@ The local default is 60 FPS at the user's request, using
 subsequent performance runs keep it enabled. The captured final
 seven seconds were inspected, without establishing that all intermittent
 corruption is gone.
+
+## Buffer-range scan experiment, not retained
+
+An occupancy bitmap was tried to skip empty heap-buffer slots without
+changing refresh frequency or ownership. Three focused checks passed, and
+a synthetic span benchmark improved from 0.48 to 0.36 ms. The native
+60 FPS opening did not demonstrate a benefit: periodic median 21.6 FPS,
+with the late span/refresh phase averaging 4.79 ms against 3.43 ms in the
+earlier run. The dynamic scene and memory conditions prevent attributing
+the difference solely to this change. It was removed; no extra regression
+runs were made. The final local executable uses the original scan.
