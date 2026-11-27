@@ -436,7 +436,7 @@ submission GPU timestamps. Its periodic median was 30.8 FPS (22.5–39.3),
 peak private commit 22808.3 MiB, peak working set 15908.4 MiB, and minimum
 free RAM 2357.8 MiB. There were no draw/indirect drops or device errors.
 The automatic player confirmation pressed at 10007 ms and released at
-11004 ms after the window became ready.
+11003 ms after the window became ready.
 
 Heavy-shot GPU work still measured approximately 26–30 ms. The preceding
 shared-allocator run had median 29.3 FPS without these timestamp diagnostics;
