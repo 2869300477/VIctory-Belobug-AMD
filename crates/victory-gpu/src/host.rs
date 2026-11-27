@@ -43,6 +43,7 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     state_preludes: prelude_pool::Pool,
+    recordings: recording_pool::Pool,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -1110,6 +1111,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             state_preludes: prelude_pool::Pool::default(),
+            recordings: recording_pool::Pool::default(),
             event,
             rtvs,
             rtv_size,
@@ -1328,9 +1330,8 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
     drop(overflow);
 }
 
-/// A host command list and its allocator, always used together.
+/// A host command list, with private or leased command storage.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Work for submission time, in recorded order.
@@ -1387,6 +1388,25 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// After `list` so abandoning an open native list destroys it before
+    /// its lease makes the allocator available to another recording.
+    allocator: Mutex<RecordingAllocator>,
+}
+
+enum RecordingAllocator {
+    Private(ID3D12CommandAllocator),
+    /// None while a completed host list waits in the idle pool.
+    Shared(Option<recording_pool::Lease>),
+}
+
+impl RecordingAllocator {
+    fn native(&self) -> &ID3D12CommandAllocator {
+        match self {
+            Self::Private(allocator) => allocator,
+            Self::Shared(Some(lease)) => lease.allocator(),
+            Self::Shared(None) => unreachable!("an idle list has no recording allocator"),
+        }
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3910,6 +3930,7 @@ mod panel;
 mod place;
 mod prelude_pool;
 pub(crate) mod rec;
+mod recording_pool;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -4305,13 +4326,15 @@ impl Host {
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let allocator = if recording_pool::on() {
+                RecordingAllocator::Shared(Some(self.recordings.take(&self.device, &self.fence)?))
+            } else {
+                RecordingAllocator::Private(self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?)
+            };
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
+                allocator.native(),
                 None,
             )?;
             let prelude = OnceLock::new();
@@ -4342,7 +4365,7 @@ impl Host {
                 );
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new(allocator),
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -6048,6 +6071,7 @@ impl Host {
             if let Some(batch) = prelude_batch.take() {
                 self.state_preludes.submitted(batch, *submitted);
             }
+            for list in runs { list.recording_submitted(*submitted); }
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -6151,6 +6175,7 @@ impl Host {
         if let Some(batch) = prelude_batch.take() {
             self.state_preludes.submitted(batch, *submitted);
         }
+        for list in runs { list.recording_submitted(*submitted); }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -6624,6 +6649,11 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        if recording_pool::on()
+            && let RecordingAllocator::Shared(Some(lease)) = &mut *self.allocator.lock().unwrap_or_else(|e| e.into_inner())
+        {
+            lease.close();
+        }
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -6651,10 +6681,86 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        self.release_recording();
+        self.clear_recording();
+        if recording_pool::on() {
+            self.open_recycled();
+        } else {
+            let allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: the list is not executing; private storage is its own.
+            let reset = unsafe {
+                allocator.native().Reset().and_then(|()| self.list.Reset(allocator.native(), None))
+            };
+            if let Err(e) = reset {
+                fail(format_args!("a host command list did not reset ({e})"));
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Keep the completed native list closed while idle. Its next caller
+    /// acquires storage when it actually starts recording, not at retirement.
+    pub(crate) fn recycle(&self) {
+        if recording_pool::on() {
+            self.release_recording();
+            self.clear_recording();
+        } else {
+            self.reset();
+        }
+    }
+
+    /// The idle pool gave this list to its next recorder. The ordinary path
+    /// still keeps idle lists open, preserving its previous behavior.
+    pub(crate) fn open_recycled(&self) {
+        if !recording_pool::on() { return; }
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let RecordingAllocator::Shared(slot) = &mut *allocator else { return; };
+        assert!(slot.is_none(), "a recycled list still owns command storage");
+        let host = host().expect("a live host list's device");
+        let lease = host.recordings.take(&host.device, &host.fence)
+            .unwrap_or_else(|e| fail(format_args!("no shared recording allocator ({e})")));
+        // SAFETY: this list is closed and exclusively owns recording with
+        // this lease. Any commands sharing the allocator remain intact.
+        if let Err(e) = unsafe { self.list.Reset(lease.allocator(), None) } {
+            fail(format_args!("a host list did not open with shared storage ({e})"));
+        }
+        *slot = Some(lease);
+    }
+
+    fn recording_submitted(&self, after: u64) {
+        if !recording_pool::on() { return; }
+        if let RecordingAllocator::Shared(Some(lease)) = &*self.allocator.lock().unwrap_or_else(|e| e.into_inner()) {
+            lease.submitted(after);
+        }
+    }
+
+    /// Called on retirement or Reset, never while this list records or is
+    /// submitted. The pool separately waits for the last actual queue fence.
+    fn release_recording(&self) {
+        if !recording_pool::on() { return; }
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        if let RecordingAllocator::Shared(slot) = &mut *allocator {
+            if let Some(lease) = slot.as_mut()
+                && lease.is_recording()
+            {
+                // A discarded open recording: flush held barriers while
+                // its resources still live, then end exclusive recording.
+                // SAFETY: the caller exclusively owns this unsubmitted list.
+                if let Err(e) = unsafe { self.list.Close() } {
+                    fail(format_args!("a discarded host recording did not close ({e})"));
+                }
+                lease.close();
+            }
+            *slot = None;
+        }
+    }
+
+    fn clear_recording(&self) {
+        self.changed_something();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -6683,17 +6789,6 @@ impl HostList {
                 give_batch_buffers(buffers);
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
-        }
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -10204,6 +10299,7 @@ impl Host {
     /// Logs [`Self::video_memory_groups`], with `when` it is said.
     pub(crate) fn log_video_memory(&self, when: &str) {
         self.state_preludes.log();
+        self.recordings.log();
         let Some([own, shared]) = self.video_memory_groups() else {
             return;
         };

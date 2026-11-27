@@ -222,7 +222,7 @@ struct Idle(crate::host::HostList, u64);
 #[cfg(windows)]
 unsafe impl Send for Idle {}
 
-/// Host lists that have run, reset and ready to record: the host side of
+/// Host lists that have run and are ready to reuse: the host side of
 /// a list a queue held, or of a part of a list cut at a wait, is taken
 /// from the title's list at its submission, and the title's list needs
 /// another. Each was made new and thrown away after its run: a hundred a
@@ -322,7 +322,10 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _)) => {
+            list.open_recycled();
+            Some(list)
+        }
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -349,8 +352,8 @@ fn detach_host(list: &mut List) -> Option<crate::host::HostList> {
 
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
-/// what they held is let go, as before, and the host lists are reset and
-/// kept for [`fresh_list`].
+/// what they held is let go, as before, and the host lists are kept for
+/// [`fresh_list`]. Shared command storage is released until then.
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
@@ -364,8 +367,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
+        // goes. Shared storage is released; private allocators stay.
+        host.recycle();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.lists.len() < idle_most() && idle.bytes + bytes <= IDLE_BYTES {
@@ -2520,6 +2523,7 @@ mod tests {
         recycle(taken, &order);
         assert_eq!(reset(this, this, std::ptr::null()), S_OK);
         assert_eq!(close(this), S_OK);
+        assert_eq!(host.log_messages(), None, "D3D12 rejected a recycled list");
     }
     use crate::object::slot;
 

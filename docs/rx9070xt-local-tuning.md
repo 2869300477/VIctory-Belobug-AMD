@@ -367,3 +367,43 @@ was 27.3 (14.7–33.8), below the previous run; only the smaller retained-list
 set and memory requirement are claimed as improvements. No image capture
 or visual validation was performed. The executable is rebuilt with the
 option's disabled path preserving the previous Reset behavior.
+
+## Shared main command storage
+
+`VICTORY_SHARED_RECORDING_ALLOCATORS=1` separates the native main list from
+its command allocator. Up to 32 closed recordings share an allocator, with
+one exclusive open recording at a time. Each list retains a lease through
+its existing retirement path, including unsubmitted and replayable lists.
+An allocator resets only after all leases are gone and the host direct
+queue's actual fence has passed every execution recorded in that group.
+Idle lists stay closed without a lease; taking one from the existing pool
+opens it with a new lease. Pool size, retirement delay and execution order
+are unchanged. The native default remains off; local Play enables this
+with `-PrivateRecordingAllocators` available to restore private storage.
+
+A focused native test checked exclusive open recording, shared closed
+recordings, replay after a completed execution, and retirement while a
+second execution was blocked behind an unsignaled fence. It checked the
+copied values after reuse and inspected D3D12 debug-layer errors. The
+existing detach/reset/recycle test also passed with sharing enabled and
+debug-message checking. Their execution times were 0.08 and 0.07 seconds;
+the diagnostic build succeeded. No full suite or visual check was run.
+
+The 45-second Series X / 60 FPS opening (`223411`) stabilized at 76 main
+allocators for about 1250 native lists, with 335751 shared acquisitions
+and 11704 group resets at the last memory report. Peak private commit was
+22405.5 MiB, working set 15544.8 MiB, and minimum free RAM 2533.0 MiB.
+The preceding ordinary run (`221603`) used 23326.0 / 16227.2 MiB and had
+2325.0 MiB minimum free RAM. No draws/indirect work were dropped and no
+device errors were logged. Periodic median FPS was 29.3 (19.3–39.7), versus
+27.3 previously; this dynamic opening is not a controlled FPS comparison.
+Only the smaller allocator set and lower observed memory peaks support
+retaining the change. Heavy-scene performance still falls short of 60 FPS.
+
+Earlier GPU timestamps (`222029`, with CPU/timeline diagnostics) showed
+roughly 25–28 ms of GPU work in heavy shots. The `222421` experiment kept
+only DRED page-fault reporting instead of automatic breadcrumbs, but still
+reported roughly 26–28 ms in heavy shots. Its periodic median was 32.7 FPS
+and peak commit 23466.0 MiB; differing diagnostic overhead and the dynamic
+scene prevent a causal FPS claim. Normal Play keeps DRED Light. Actual
+viewport diagnostics observed 2560×1440 scene rendering and 3840×2160 output.
