@@ -372,7 +372,11 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         idle.since_ms = now;
         gone
     };
+    let released = gone.len();
     drop(gone);
+    if released > 0 {
+        tracing::info!(lists = released, "idle host lists unused during the trim interval released");
+    }
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
