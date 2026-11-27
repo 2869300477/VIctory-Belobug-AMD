@@ -26,6 +26,7 @@ the local defaults; memory pressure and heavy-scene FPS remain open.
 
 ```powershell
 $env:VICTORY_WINDOWS_BAR_MB = '3072'
+$env:VICTORY_WINDOWS_BAR_PERCENT = '90'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '128'
 $env:VICTORY_CARD_BUFFERS_MB = '1536'
 $env:VICTORY_STAGING_BLOCK_MB = '16'
@@ -254,3 +255,21 @@ with the late span/refresh phase averaging 4.79 ms against 3.43 ms in the
 earlier run. The dynamic scene and memory conditions prevent attributing
 the difference solely to this change. It was removed; no extra regression
 runs were made. The final local executable uses the original scan.
+
+## Window placement under the Series X budget
+
+`VICTORY_WINDOWS_BAR_PERCENT` optionally raises the adapter-budget ceiling
+for mapped windows from 80 percent to a value between 80 and 95. The window
+byte cap is independent and unchanged; the native default remains 80.
+The local preset selects 90 with its existing 3072 MiB cap. This is the
+same placement control discussed upstream in PR 394, without its unrelated
+texture trimming, residency or staging changes.
+
+In a 45-second Series X sample, the final window spans were 4 MiB in system
+memory and 2956 MiB in mapped VRAM, compared with 560 / 2208 MiB in the prior
+80-percent run. Local VRAM was 12230 MiB against a 14272 MiB budget. Private
+commit peaked at 25304.7 MiB, working set at 17335.5 MiB, and minimum free RAM
+was 584.3 MiB. Median periodic FPS stayed 22.6; no draw drops or device errors
+were logged. This directly confirms placement of more windows in VRAM,
+not a precise net physical-RAM saving or a frame-rate improvement. System
+memory pressure remains substantial.

@@ -515,6 +515,24 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// The adapter-budget ceiling for CPU-mapped windows. The default keeps
+/// one fifth free; an explicit 80–95 percent leaves a smaller reserve on
+/// hosts short of RAM. The separate window byte limit still applies.
+fn window_mapped_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let asked = std::env::var("VICTORY_WINDOWS_BAR_PERCENT").ok();
+        let parsed = asked.as_deref().and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|p| (80..=95).contains(p));
+        if asked.is_some() && parsed.is_none() {
+            tracing::warn!("VICTORY_WINDOWS_BAR_PERCENT expects 80–95; using 80");
+        }
+        let percent = parsed.unwrap_or(80);
+        tracing::info!(percent, limit_mib = window_mapped_most() >> 20, "CPU-mapped windows adapter-budget ceiling");
+        percent
+    })
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -524,7 +542,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used.saturating_add(size) > budget / 100 * window_mapped_percent()
     {
         return None;
     }
