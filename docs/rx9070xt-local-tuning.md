@@ -36,6 +36,7 @@ $env:VICTORY_UPSCALER = '6'
 $env:VICTORY_RESIDENCY = '1'
 $env:VICTORY_WC_NO_BACK = '1'
 $env:VICTORY_SHARED_PRELUDE_ALLOCATORS = '1'
+$env:VICTORY_LIST_LAZY_ATTACH = '1'
 ```
 
 These local settings do not change the runtime's global defaults.
@@ -344,3 +345,25 @@ large allocation groups and was removed. These dynamic runs are not a
 controlled FPS estimate; the allocator count and lower memory requirement
 support retaining the shared-prelude change. No screenshots or flicker
 checks were made, following the player's request.
+
+## Deferred replacement of detached lists
+
+`VICTORY_LIST_LAZY_ATTACH=1` takes a submitted list's host recording out
+without immediately acquiring its replacement. The next Reset acquires
+an already-open pool entry or a new host recording. This preserves pool
+capacity, completed-submission retirement, command ordering and upload/
+descriptor ownership; it does not include PR 335's allocator-age retirement
+or smaller pool limits. The native default is off. Local play enables it;
+`-EagerListReplacements` restores immediate replacement.
+
+A targeted native test kept the detached recording alive while resetting
+the original list, verified independent deferred writes, then exercised
+both ordinary and split detachment. It passed in 0.07 seconds. A 45-second
+Series X run ended with 1179 host lists (1441 in the prior shared-prelude
+run), with the count nearly stable after world entry. Peak private commit
+was 23326.0 MiB, peak working set 16227.2 MiB, minimum free RAM 2325.0 MiB.
+No draw/indirect drops or device errors were logged. Median periodic FPS
+was 27.3 (14.7–33.8), below the previous run; only the smaller retained-list
+set and memory requirement are claimed as improvements. No image capture
+or visual validation was performed. The executable is rebuilt with the
+option's disabled path preserving the previous Reset behavior.

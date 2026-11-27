@@ -327,6 +327,26 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+/// A submitted list needs its next host recording only when it is reset.
+/// Keep allocator pooling and retirement unchanged; do not reserve a spare
+/// host list on every inactive title/translation list in the meantime.
+#[cfg(windows)]
+fn lazy_attach() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LIST_LAZY_ATTACH"))
+}
+
+#[cfg(windows)]
+fn detach_host(list: &mut List) -> Option<crate::host::HostList> {
+    if lazy_attach() {
+        list.host.take()
+    } else {
+        let fresh = fresh_list()?;
+        fresh.close();
+        list.host.replace(fresh)
+    }
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
@@ -488,16 +508,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = detach_host(list) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -560,17 +574,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = detach_host(&mut *list) else {
                 continue;
             };
             let uploads =
@@ -763,16 +771,24 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]
-    {
+    let newly_attached = {
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
-    }
+        let missing = lazy_attach() && list.host.is_none();
+        if missing {
+            // Pool entries and newly made lists are already open. Their
+            // previous resources were retired by the existing recycle path.
+            list.host = fresh_list();
+            if list.host.is_none() { return object::E_OUTOFMEMORY; }
+        }
+        missing
+    };
     #[cfg(windows)]
     with_state(this, |host, state| {
-        host.reset();
+        if !newly_attached { host.reset(); }
         state.reset(pipeline);
     });
     crate::pipeline::bound(pipeline);
@@ -2467,6 +2483,44 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run with VICTORY_LIST_LAZY_ATTACH=1 on the native GPU"]
+    fn detached_lists_acquire_the_next_recording_at_reset() {
+        assert!(lazy_attach(), "set VICTORY_LIST_LAZY_ATTACH=1");
+        let host = crate::host::host().expect("native GPU");
+        let mut list = boxed(0, std::ptr::null(), false);
+        let this: This = std::ptr::from_mut(&mut *list).cast::<Object>().cast_const();
+        let mut first = 0u64;
+        list.host.as_ref().unwrap().defer_write(std::ptr::from_mut(&mut first).cast(), Written::Value(17), 8);
+        assert_eq!(close(this), S_OK);
+        let (taken, order) = detach(&[this, this]);
+        assert_eq!(order, [0, 0]);
+        assert_eq!(taken.len(), 1);
+        assert!(list.host.is_none());
+        // The title starts another recording while the old one is still
+        // retained for execution. Its deferred values must stay independent.
+        assert_eq!(reset(this, this, std::ptr::null()), S_OK);
+        assert!(list.host.is_some());
+        let mut second = 0u64;
+        list.host.as_ref().unwrap().defer_write(std::ptr::from_mut(&mut second).cast(), Written::Value(29), 8);
+        assert_eq!(close(this), S_OK);
+        host.execute(&[taken[0].host()]);
+        assert_eq!((first, second), (17, 0));
+        recycle(taken, &[0]);
+        // The split-list submission path also defers obtaining a replacement.
+        let mut parts = detach_parts(&[this]);
+        assert_eq!(parts.len(), 1);
+        let (waits, taken, order) = parts.pop().unwrap();
+        assert!(waits.is_empty() && list.host.is_none());
+        assert_eq!(order, [0]);
+        host.execute(&[taken[0].host()]);
+        assert_eq!(second, 29);
+        recycle(taken, &order);
+        assert_eq!(reset(this, this, std::ptr::null()), S_OK);
+        assert_eq!(close(this), S_OK);
+    }
     use crate::object::slot;
 
     #[test]
