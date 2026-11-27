@@ -2823,32 +2823,43 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            let at = 2 * views.made.len() as u32;
+            let (start, step) = (views.start, views.step);
+            debug_assert!(!windows::core::Interface::as_raw(&views.heap).is_null());
+            let slot = |i: u32| {
+                debug_assert!(i < ListViews::SLOTS);
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step }
+            };
+            // A repeated table hits this cache for most of its views. Keep
+            // that one lookup, and only create descriptors on a miss.
+            use std::collections::hash_map::Entry;
+            let made = match views.made.entry(words) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let view = super::view_at(words[1], words[2])?;
+                    // (A constant buffer's bytes are copied for each draw.)
+                    if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                        return None;
+                    }
+                    let twin = twinned(&view);
+                    let kept = make_twinned(&view, slot(at), Some(slot(at + 1)))?;
+                    let listed = Listed {
+                        kind: crate::draw::view_kind(&view),
+                        texture: is_texture_view(&view),
+                        ready: (0, 0, false),
+                        tabled: None,
+                    };
+                    entry.insert(ListView { view, at, twin, kept, listed })
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
-            }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
+            };
+            self.copy_from(index, slot(made.at));
             if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.copy_from(self.raw + index, slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -2897,6 +2908,7 @@ impl HostHeap {
     /// The raw twin of slot `index` is a null view again.
     fn clear_twin(&self, index: u32) {
         if let Some(made) = self.twins.get(index as usize)
+            && made.load(std::sync::atomic::Ordering::Relaxed)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             null_buffer_view(self.at(self.raw + index));
@@ -2906,6 +2918,18 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        use windows::core::Interface;
+        self.keep_with(index, resource.as_ref().map(Interface::as_raw), || resource);
+    }
+
+    /// A cached view keeps its own reference. Take another only when the
+    /// destination changes, still checking under the slot's existing lock.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        use windows::core::Interface;
+        self.keep_with(index, resource.map(Interface::as_raw), || resource.cloned());
+    }
+
+    fn keep_with(&self, index: u32, raw: Option<*mut std::ffi::c_void>, make: impl FnOnce() -> Kept) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -2913,10 +2937,10 @@ impl HostHeap {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map(Interface::as_raw) == raw {
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            std::mem::replace(&mut *slot, make())
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -2958,7 +2982,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3001,7 +3025,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3089,7 +3113,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3137,7 +3161,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
@@ -6145,11 +6169,6 @@ impl ListViews {
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
             Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
         }
-    }
-
-    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
-        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
     }
 }
 
