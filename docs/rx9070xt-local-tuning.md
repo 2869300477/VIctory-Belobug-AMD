@@ -57,3 +57,35 @@ because its FPS benefit remained unproven. Runtime sources and settings were
 restored to the earlier configuration; neither experiment is a delivered
 performance or visual fix. Zero draw-drop counts and successful unit tests
 were insufficient to establish visual correctness.
+
+Later observations also found intermittent local flickering on the restored
+baseline, at varying locations for roughly ten seconds of a whole run.
+The earlier ordering experiment therefore does not establish the cause.
+The reconstruction setting improves hair, but is not a complete flicker fix.
+
+## Upload-pool fragmentation
+
+`VICTORY_STAGING_BLOCK_MB` optionally selects 8, 16, 32 or 64 MiB blocks for
+the system-memory upload pool. Unset or invalid values retain 64 MiB.
+The texture heap pool stays at 64 MiB. Uploads larger than half a pool
+block still use standalone buffers; live-piece ownership and the existing
+2500 ms reuse delay are unchanged.
+
+The `staging pool` diagnostic separates bytes still owned, returned pieces
+waiting for the reuse delay, and reusable ranges. It also reports the
+subset of reusable bytes in wholly empty blocks. Standalone buffers are
+excluded. For example, one 64 MiB-pool sample held 640 MiB: 47.6 MiB still
+owned, 18.8 MiB waiting, and 573.6 MiB reusable, of which only 64 MiB was in
+a whole empty block. Dropping empty blocks alone cannot reclaim the holes.
+
+In short opening samples, the final ten pool statistics averaged 492.8 MiB
+with 64 MiB blocks and 278.4 MiB with 16 MiB blocks. Still-owned pieces were
+about 50 MiB in both. The 16 MiB run also captured frames, so this is evidence
+of reduced pool storage, not an FPS comparison or a precise change in total
+process memory. Three focused allocator tests cover the smaller block
+boundary, non-overlap, protected live/resting pieces and texture-heap age.
+
+The pop watcher now reads Series S's composed back buffer as well as ordinary
+single-texture output. A bounded run produced 1070 local frames. Inspected
+large changes included credits, camera cuts and police lighting; these do
+not identify the intermittent rendering fault reported by the player.

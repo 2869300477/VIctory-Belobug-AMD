@@ -879,6 +879,12 @@ fn log_memory() {
     {
         let [textures, staging] = pool;
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let [allocated, held, resting, reusable, empty] = crate::pool::staging_usage().map(|bytes| bytes as f64 / (1 << 20) as f64);
+        tracing::info!(
+            "staging pool: {allocated:.1} MiB allocated; {held:.1} MiB in pieces not yet returned, \
+             {resting:.1} MiB waiting for the reuse delay, {reusable:.1} MiB reusable \
+             ({empty:.1} MiB of that in whole empty blocks); standalone staging buffers excluded"
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(

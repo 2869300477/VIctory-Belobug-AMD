@@ -196,6 +196,8 @@ struct Block<B> {
 }
 
 struct Pool<B> {
+    /// Textures use 64 MiB; upload pools may use smaller blocks.
+    block_bytes: u64,
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
@@ -210,7 +212,11 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Self::with_block_size(most, BLOCK)
+    }
+
+    const fn with_block_size(most: usize, block_bytes: u64) -> Pool<B> {
+        Pool { block_bytes, blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -231,7 +237,7 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.block_bytes } else { self.block_bytes / 2 } {
             return None;
         }
         self.rested(now);
@@ -267,7 +273,7 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.block_bytes)).count();
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
@@ -302,7 +308,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.block_bytes), used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -326,7 +332,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(self.block_bytes);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -335,7 +341,7 @@ impl<B: Clone> Pool<B> {
             self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(self.block_bytes)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -348,6 +354,15 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn usage(&self) -> [u64; 5] {
+        let allocated = self.blocks() as u64 * self.block_bytes;
+        let reusable = self.blocks.iter().flatten().flat_map(|b| b.free.0.values()).sum::<u64>();
+        let resting = self.resting.iter().map(|(_, piece)| piece.len).sum::<u64>();
+        let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.block_bytes)).count() as u64 * self.block_bytes;
+        [allocated, allocated.saturating_sub(reusable).saturating_sub(resting), resting, reusable, empty]
+    }
 }
 
 /// A mapped upload buffer's memory.
@@ -357,7 +372,19 @@ struct Upload(ID3D12Resource, *mut u8);
 unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static STAGING: std::sync::LazyLock<Mutex<Pool<Upload>>> = std::sync::LazyLock::new(|| {
+    // Only the upload pool changes size. Texture heaps and the reuse delay
+    // keep their existing rules; uploads too large for a pool block retain
+    // the standalone-buffer fallback.
+    let requested = std::env::var("VICTORY_STAGING_BLOCK_MB").ok();
+    let mb = requested.as_deref().and_then(|s| s.trim().parse::<u64>().ok()).filter(|n| matches!(n, 8 | 16 | 32 | 64));
+    if requested.is_some() && mb.is_none() {
+        tracing::warn!("VICTORY_STAGING_BLOCK_MB expects 8, 16, 32 or 64; using 64 MiB");
+    }
+    let block_bytes = mb.unwrap_or(64) << 20;
+    tracing::info!(block_mib = block_bytes >> 20, "texture upload pool block size");
+    Mutex::new(Pool::with_block_size(STAGING_KEPT, block_bytes))
+});
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -374,7 +401,17 @@ pub(crate) fn texture_room() -> u64 {
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    let textures = lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20);
+    let staging = lock(&STAGING);
+    [textures, staging.blocks() as u64 * (staging.block_bytes >> 20)]
+}
+
+/// Upload-pool bytes: allocated, in pieces not yet returned, waiting for
+/// the reuse delay, reusable, and the reusable subset in whole blocks.
+/// Standalone staging buffers are not included.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_usage() -> [u64; 5] {
+    lock(&STAGING).usage()
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -394,17 +431,20 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut pool = lock(&STAGING);
+    let block_bytes = pool.block_bytes;
+    let (piece, memory, again) = pool.take(bytes, 512, now(), || {
         // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
         // while commit is short; those a draw samples now still get one.)
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        let (buffer, data) = host.upload_buffer(block_bytes)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
+    drop(pool);
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -729,6 +769,34 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_upload_blocks_keep_live_and_resting_pieces_until_safe_to_reuse() {
+        let size = 16 << 20;
+        let mut pool = Pool::with_block_size(0, size);
+        let mut pieces = Vec::new();
+        for _ in 0..4 {
+            let (piece, _, _) = pool.take(size / 4, 512, 0, || Some(1u32)).unwrap();
+            assert_eq!(piece.block, 0);
+            assert!(piece.start + piece.len <= size);
+            pieces.push(piece);
+        }
+        assert_eq!(pool.usage(), [size, size, 0, 0, 0]);
+        let first = pieces.remove(0);
+        pool.give(first, 0);
+        pool.reclaim(REST - 1, 0, true);
+        assert_eq!(pool.usage(), [size, size * 3 / 4, size / 4, 0, 0]);
+        assert!(pool.take(size / 4, 512, REST - 1, || None).is_none());
+        let (reused, _, again) = pool.take(size / 4, 512, REST, || None).unwrap();
+        assert_eq!(reused, first);
+        assert!(again);
+        assert!(pool.take(size / 2 + 1, 512, REST, || Some(2)).is_none());
+        for piece in pieces.into_iter().chain([reused]) {
+            pool.give(piece, REST);
+        }
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.usage(), [0; 5]);
+    }
 
     #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
