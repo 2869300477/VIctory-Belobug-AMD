@@ -53,8 +53,6 @@ pub(crate) enum C {
     /// and the nanoseconds of the searches.
     DynamicAsked,
     DynamicRefused,
-    DynamicReleaseRanges,
-    DynamicReleaseLocks,
     DynamicNs,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
@@ -1338,13 +1336,6 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
-    if c[C::DynamicReleaseLocks as usize] != 0.0 {
-        tracing::info!(
-            "dynamic descriptor releases per frame: {:.0} ranges in {:.0} heap allocator locks",
-            c[C::DynamicReleaseRanges as usize],
-            c[C::DynamicReleaseLocks as usize],
-        );
-    }
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
