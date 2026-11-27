@@ -1858,7 +1858,7 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// [`HostHeap::release_many`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
@@ -2777,17 +2777,42 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
+    #[cfg(test)]
+    fn release(&self, first: u32, n: u32) {
+        self.release_many([(first, n)]);
+    }
+
+    /// Releases ranges only after their list is done, under one allocator
+    /// lock. Overlaps count once, and slots outside the ranges stay held.
+    pub(crate) fn release_many(&self, ranges: impl IntoIterator<Item = (u32, u32)>) {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let mut given = 0;
+        #[cfg(feature = "diagnostics")]
+        let mut count = 0;
+        for (first, n) in ranges {
+            #[cfg(feature = "diagnostics")]
+            {
+                count += 1;
+            }
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = at.saturating_add(n).min(self.dynamic) as usize;
+            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+                given += slots.iter().filter(|taken| **taken).count() as u32;
+                slots.fill(false);
+            }
+        }
+        if given != 0 {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
+        }
+        drop(guard);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::DynamicReleaseRanges, count);
+            add(C::DynamicReleaseLocks, 1);
         }
     }
 
@@ -6056,6 +6081,28 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_batch_release_preserves_live_slots_and_counts_overlaps_once() {
+        let heap = HostHeap::new(false, 4).expect("host descriptor heap");
+        let first = heap.dynamic(heap.dynamic).unwrap();
+        assert_eq!(heap.dynamic(1), None);
+        // A failed large request must become possible after adjacent frees.
+        heap.release_many([(first + 10, 20), (first + 30, 10), (first + 15, 10)]);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), 30);
+        assert_eq!(heap.dynamic(31), None);
+        assert_eq!(heap.dynamic(30), Some(first + 10));
+        assert_eq!(heap.dynamic(1), None);
+
+        // Invalid starts and empty ranges give back no live slot. A range
+        // past the end is clipped without wrapping its u32 end around.
+        heap.release_many([(first - 1, 1), (first + 50, 0), (u32::MAX, 2)]);
+        assert_eq!(heap.dynamic(1), None);
+        heap.release_many([(first + heap.dynamic - 2, u32::MAX)]);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(heap.dynamic(2), Some(first + heap.dynamic - 2));
+        assert_eq!(heap.dynamic(1), None);
     }
 
     #[test]
