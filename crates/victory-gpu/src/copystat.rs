@@ -1019,18 +1019,27 @@ fn log_memory() {
         lists[3],
     );
     if memory_categories() {
+        let placement = crate::shadow::window_placement();
+        tracing::info!(
+            "window spans by placement: {:.0} MiB system-memory copies, {:.0} MiB CPU-mapped VRAM copies, \
+             {:.0} MiB two-sided copies (also keep a RAM mirror), {:.0} MiB original pages in place; \
+             {:.0} MiB of the CPU-mapped VRAM spans have declared shader writes",
+            mb(placement[0]), mb(placement[1]), mb(placement[2]), mb(placement[3]), mb(placement[4])
+        );
+        tracing::info!(
+            "host list counts: {} alive, {} never reset; counts, not byte allocations",
+            alive[0], lists[3]
+        );
         let fields: &[(&str, u64)] = &[
             ("working set", working),
             ("private total", private),
             ("free physical", free),
             ("commit headroom", left),
-            ("host lists alive", alive[0]),
-            ("lists never reset", lists[3]),
             ("list scratch live", alive[2]),
             ("list scratch spare", alive[4]),
             ("list other uploads", alive[7]),
             ("private growth making lists", lists[2]),
-            ("title window copies", copies[1]),
+            ("all shadow copy spans", copies[1]),
             ("window pages copied", window[0]),
             ("window held by lists", window[4]),
             ("window without a length", window[6]),

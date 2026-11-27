@@ -3100,6 +3100,36 @@ pub(crate) fn memory() -> [u64; 6] {
     ]
 }
 
+/// Logical window spans by placement, each window counted once even when
+/// several lookup keys name it: system-memory copy, CPU-mapped video-memory
+/// copy, two-sided copy, original title pages used in place, and the subset
+/// of CPU-mapped video-memory copies ever declared written by shaders.
+/// A two-sided copy also keeps a system-memory mirror; these are span sizes,
+/// not process commit or driver allocation totals. Windows retained only by
+/// in-flight work after removal from LOOSE are not included.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_placement() -> [u64; 5] {
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = [0; 5];
+    for shadow in loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)) {
+        let kind = if shadow.place.is_some() {
+            3
+        } else if shadow.mapped {
+            1
+        } else if shadow.card.is_some() {
+            2
+        } else {
+            0
+        };
+        bytes[kind] += shadow.len;
+        if shadow.mapped && shadow.written.load(Ordering::Relaxed) {
+            bytes[4] += shadow.len;
+        }
+    }
+    bytes
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
