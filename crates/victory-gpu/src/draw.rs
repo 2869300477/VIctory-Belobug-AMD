@@ -555,10 +555,17 @@ pub(crate) fn dropped_now() -> u64 {
     DROPPED.load(Ordering::Relaxed)
 }
 
-/// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
+/// Draws, mesh dispatches and dispatches that could not run on the host
+/// since the last call (pipeline, binding or unsupported draw failures).
+/// Dispatches withheld while the ray-tracing builder is inactive are separate.
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
+}
+
+/// Dispatches withheld by the ray-tracing builder's all-or-none gate since
+/// the last call (disabled, missing a pipeline, or resting after a bind failure).
+pub(crate) fn take_skipped_builders() -> u64 {
+    SKIPPED_BUILDERS.swap(0, Ordering::Relaxed)
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
@@ -786,6 +793,7 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static SKIPPED_BUILDERS: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -2811,10 +2819,10 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            SKIPPED_BUILDERS.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::capture::op(0, || "SKIPPED: the ray-tracing structure builder is inactive".to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
             return;
