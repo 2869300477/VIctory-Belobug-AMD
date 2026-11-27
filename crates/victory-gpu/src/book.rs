@@ -57,6 +57,15 @@ struct Book {
     gone: VecDeque<(Entry, u64)>,
     /// Objects whose address could not be told, by what they are.
     unknown: BTreeMap<String, u64>,
+    /// CPU mappings, removed by the object's existing COM lifetime notice.
+    mapped: HashMap<u64, CpuMapping>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CpuMapping {
+    pub start: usize,
+    pub bytes: u64,
+    pub kind: &'static str,
 }
 
 static BOOK: Mutex<Option<Book>> = Mutex::new(None);
@@ -106,6 +115,7 @@ impl Book {
     }
 
     fn remove(&mut self, id: u64, object: usize, now: u64) {
+        self.mapped.remove(&id);
         if let Some(entry) = self.live.remove(&id) {
             self.by_start.remove(&(entry.start, id));
             if entry.size > LONG {
@@ -342,6 +352,42 @@ pub(crate) fn made(resource: &ID3D12Resource, what: impl FnOnce() -> String) {
     let now = crate::host::now_ms();
     let id = with(|b| b.add(raw, start, size.max(1), what, now));
     watch(&object, id);
+}
+
+/// Opt-in CPU address attribution for the memory-map census. No references
+/// to the resource are kept, and no mapped memory is read.
+pub(crate) fn mapped(object: &impl Interface, start: usize, bytes: u64, kind: &'static str) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_MEMORY_OWNERS")) || !on() || start == 0 {
+        return;
+    }
+    let Ok(object) = object.cast::<ID3D12Object>() else { return };
+    let raw = object.as_raw() as usize;
+    let notice = with(|b| {
+        let (id, new) = match b.by_object.get(&raw).copied() {
+            Some(id) => (id, false),
+            None => {
+                b.next += 1;
+                b.by_object.insert(raw, b.next);
+                (b.next, true)
+            }
+        };
+        b.mapped.insert(id, CpuMapping { start, bytes, kind });
+        new.then_some(id)
+    });
+    if let Some(id) = notice {
+        watch(&object, id);
+    }
+}
+
+pub(crate) fn cpu_mappings() -> Vec<CpuMapping> {
+    with(|b| b.mapped.values().copied().collect())
+}
+
+pub(crate) fn large_cpu_mappings() -> Vec<(CpuMapping, String)> {
+    with(|b| b.mapped.iter().filter(|(_, m)| m.bytes >= 32 << 20)
+        .map(|(id, m)| (*m, b.live.get(id).map_or_else(|| m.kind.to_owned(), |e| e.what.clone())))
+        .collect())
 }
 
 /// A block of texture memory, found by the texture `resource` at `offset` of it.

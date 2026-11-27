@@ -3826,6 +3826,8 @@ fn late_line(frames: f64) {
             r[4] / 1000.0,
         );
         if send::own() {
+            #[cfg(feature = "diagnostics")]
+            send::log_memory();
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
                 "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
@@ -9181,6 +9183,7 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "an upload buffer".into());
+            crate::book::mapped(b, data as usize, size, "upload buffers");
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -10179,6 +10182,7 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "a shared buffer".into());
+            crate::book::mapped(b, data as usize, size, "shared write-back buffers");
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
@@ -10263,6 +10267,13 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "a CPU-mapped card buffer".into());
+            crate::book::mapped(b, data as usize, size, "mapped card buffers");
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {

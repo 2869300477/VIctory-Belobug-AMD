@@ -640,6 +640,72 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
     stands.clear();
 }
 
+/// Allocation, start, bytes, committed, type, protection.
+type MemoryRegion = (usize, usize, usize, bool, u32, u32);
+
+/// Relates live CPU mappings to the existing address-space census. A driver
+/// allocation may contain several resources or unexposed storage: its whole
+/// size is reported separately from the spans the resources actually expose.
+fn log_memory_owners(regions: &[MemoryRegion], whole: &HashMap<usize, usize>) {
+    use std::collections::BTreeMap;
+    use windows_sys::Win32::System::Memory::PAGE_WRITECOMBINE;
+    let mappings = crate::book::cpu_mappings();
+    if mappings.is_empty() {
+        return;
+    }
+    let mut owners: HashMap<usize, BTreeMap<&str, u64>> = HashMap::new();
+    let mut spans: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+    let mut missed = 0;
+    for m in mappings {
+        let n = regions.partition_point(|r| r.1 <= m.start);
+        let Some(r) = n.checked_sub(1).and_then(|i| regions.get(i)) else {
+            missed += 1;
+            continue;
+        };
+        if m.start - r.1 >= r.2 {
+            missed += 1;
+            continue;
+        }
+        *owners.entry(r.0).or_default().entry(m.kind).or_default() += m.bytes;
+        let total = spans.entry(m.kind).or_default();
+        total.0 += 1;
+        total.1 += m.bytes;
+    }
+    let spans: Vec<_> = spans.into_iter().map(|(kind, (n, bytes))| {
+        format!("{kind}: {n} objects, {} MiB exposed", bytes >> 20)
+    }).collect();
+    tracing::info!("memory map, live CPU mappings (not unique physical RAM): {}; {missed} starts absent from census", spans.join("; "));
+    let mut large = crate::book::large_cpu_mappings();
+    large.sort_by_key(|(m, _)| std::cmp::Reverse(m.bytes));
+    let large: Vec<_> = large.iter().take(16).map(|(m, name)| {
+        format!("{} MiB {} ({name})", m.bytes >> 20, m.kind)
+    }).collect();
+    tracing::info!("memory map, largest live CPU mappings: {}", large.join("; "));
+    // Group only write-combined allocations. An untracked allocation can be
+    // a default-heap texture, command storage, or something else in the driver.
+    let mut allocations: HashMap<usize, u64> = HashMap::new();
+    for r in regions.iter().filter(|r| r.3 && r.5 & PAGE_WRITECOMBINE != 0) {
+        *allocations.entry(r.0).or_default() += r.2 as u64;
+    }
+    let mut groups: BTreeMap<(String, usize), (usize, u64, u64)> = BTreeMap::new();
+    for (base, committed) in allocations {
+        let owner = owners.get(&base);
+        let label = owner.map(|v| v.keys().copied().collect::<Vec<_>>().join(" + "))
+            .unwrap_or_else(|| "no tracked CPU mapping".into());
+        let exposed = owner.map_or(0, |v| v.values().sum());
+        let group = groups.entry((label, whole.get(&base).copied().unwrap_or(0))).or_default();
+        group.0 += 1;
+        group.1 += committed;
+        group.2 += exposed;
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1.1));
+    let groups: Vec<_> = groups.into_iter().take(24).map(|((kind, size), (n, committed, exposed))| {
+        format!("{kind}: {n} allocations of {:.2} MiB, {} MiB committed / {} MiB exposed", size as f64 / (1 << 20) as f64, committed >> 20, exposed >> 20)
+    }).collect();
+    tracing::info!("memory map, write-combined allocations by CPU mapping start (concurrent snapshot): {}", groups.join("; "));
+}
+
 /// Logs what the process has committed by kind, from a walk of its address
 /// space, and how much of each kind is in physical memory (one page in
 /// sixteen is asked about). The kinds tell the title's own memory from
@@ -676,9 +742,7 @@ fn log_memory_map() {
     /// One page asked about stands for this much.
     const STEP: usize = 64 << 10;
     let started = std::time::Instant::now();
-    // Allocation, start, bytes, committed, type, protection.
-    type Region = (usize, usize, usize, bool, u32, u32);
-    let mut regions: Vec<Region> = Vec::new();
+    let mut regions: Vec<MemoryRegion> = Vec::new();
     let mut at = 0usize;
     loop {
         // SAFETY: plain data filled in by the query.
@@ -708,7 +772,7 @@ fn log_memory_map() {
     for r in &regions {
         *whole.entry(r.0).or_default() += r.2;
     }
-    let kind = |r: &Region| -> usize {
+    let kind = |r: &MemoryRegion| -> usize {
         let size = whole.get(&r.0).copied().unwrap_or(0);
         let console = r.0 < HOST;
         if r.4 == MEM_IMAGE {
@@ -801,6 +865,7 @@ fn log_memory_map() {
         groups.len(),
         biggest.join("; ")
     );
+    log_memory_owners(&regions, &whole);
 }
 
 /// Logs where the memory is: the process and the PC, then what this crate

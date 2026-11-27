@@ -1704,6 +1704,8 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::book::mapped(&heap, cpu, u64::from(size) * u64::from(step), "shader-visible descriptor heaps");
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };

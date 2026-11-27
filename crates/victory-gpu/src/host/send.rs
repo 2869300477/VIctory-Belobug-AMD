@@ -21,6 +21,8 @@
 
 use super::*;
 use crate::shadow::Shadow;
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::AtomicU64;
 
 pub(super) fn own() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -120,7 +122,30 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| std::env::var("VICTORY_SEND_SPARE_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v <= 4096)
+        .map(|v| v << 20));
+    limit.unwrap_or_else(|| if on_card() { 256 << 20 } else { 768 << 20 })
+}
+
+/// Diagnostic totals: made buffers/bytes, returned buffers discarded/bytes,
+/// and the largest request since the previous report. Active sends are never
+/// part of the spare budget.
+#[cfg(feature = "diagnostics")]
+static POOL_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+pub(super) fn log_memory() {
+    let (count, bytes, largest) = {
+        let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        (spare.len(), spare.iter().map(|m| m.size).sum::<u64>(), spare.iter().map(|m| m.size).max().unwrap_or(0))
+    };
+    let n = |i: usize| POOL_STATS[i].load(Ordering::Relaxed);
+    let peak = POOL_STATS[4].swap(0, Ordering::Relaxed);
+    tracing::info!("submission upload pool: {count} spare buffers, {} MiB (limit {} MiB, largest {} MiB); since start made {} buffers / {} MiB, discarded {} / {} MiB; largest recent request {:.2} MiB",
+        bytes >> 20, kept() >> 20, largest >> 20, n(0), n(1) >> 20, n(2), n(3) >> 20, peak as f64 / (1 << 20) as f64);
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -136,6 +161,8 @@ fn on_card() -> bool {
 }
 
 fn memory(host: &Host, size: u64) -> Option<Memory> {
+    #[cfg(feature = "diagnostics")]
+    POOL_STATS[4].fetch_max(size, Ordering::Relaxed);
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
@@ -152,6 +179,11 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         None => host.upload_buffer(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
+    #[cfg(feature = "diagnostics")]
+    {
+        POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+        POOL_STATS[1].fetch_add(size, Ordering::Relaxed);
+    }
     Some(Memory {
         buffer,
         data: data as usize,
@@ -165,7 +197,13 @@ pub(super) fn give_back(memory: Memory) {
     spare.push(memory);
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
     while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
+        let gone = spare.remove(0);
+        #[cfg(feature = "diagnostics")]
+        {
+            POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+            POOL_STATS[3].fetch_add(gone.size, Ordering::Relaxed);
+        }
+        drop(gone);
     }
 }
 

@@ -172,3 +172,53 @@ A native startup logged the press at 10003 ms and release at 11005 ms from
 window readiness and entered the story without manual input. The window
 clock does not establish that an arbitrary title's menu is ready; the logs
 make input delivery timing inspectable if a later build loads differently.
+
+## CPU mapping attribution and spare submission uploads
+
+With the resource book enabled, `VICTORY_MEMORY_OWNERS=1` associates live
+CPU mappings with upload buffers, shared buffers, mapped card buffers and
+shader-visible descriptor heaps. The existing memory census reports the
+exposed spans separately from the Windows allocations containing their
+starts. COM lifetime notices remove records without retaining resources.
+The census is concurrent: unmatched starts and untracked driver allocations
+are reported, and neither committed address space nor exposed spans are a
+measure of unique physical RAM.
+
+An opening census found 1562 MiB of upload mappings, including a single
+512 MiB allocation. `VICTORY_SEND_SPARE_MB` now optionally bounds completed
+submission uploads kept for reuse (0–4096 MiB). Unset or invalid values keep
+the previous defaults: 768 MiB in system memory, 256 MiB with SEND_BAR.
+The bound applies only after completion, when the existing pool receives
+the buffer back. Allocation sizes, copying and submission ordering are
+unchanged. Diagnostics report spare bytes, allocation/discard totals and
+the largest recent request, so repeated allocations can be detected.
+
+The local 24 GiB preset selects 256 MiB. In a 45-second scene sample, two
+returned buffers totaling 768 MiB were discarded; allocation count settled
+at 11 (968 MiB cumulatively allocated), and the retained set totaled 200 MiB.
+Later requests peaked near 22 MiB in the reported intervals. The census
+then found 1022 MiB of upload mappings; its largest was the remaining
+128 MiB submission buffer. No continuing pool-allocation churn was logged.
+
+The preceding default-budget sample and the bounded sample both had a
+30.0 FPS median of nine periodic ready-scene statistics. Peak working sets
+were 15715.6 and 15263.4 MiB; minimum free RAM 2470.3 and 3104.3 MiB;
+peak private commit 21904.4 and 21724.7 MiB. Neither logged draw drops or
+device errors. These are short, dynamic opening runs, so the process-wide
+deltas and the FPS minima (23.0 and 16.5) are not controlled causal estimates.
+The directly observed result is reduced retained upload capacity without
+repeated allocation in that scene. Loading stalls and intermittent patches
+remain unresolved.
+
+The optional existing 60 FPS override was also tried with this pool budget.
+All three loader timing checks applied, including the simulation's minimum
+step; the runtime interval was 16.667 ms. Menus reached 60 FPS and a light
+scene interval reached 52.8, but the 85-second opening had a periodic median
+of 27.3 with loading/heavy-scene dips. Peak working set was 15366.5 MiB and
+minimum free physical memory 3144.3 MiB. The upload pool still stabilized
+(12 allocations, two discards); no draw drops or device errors were logged.
+The final part also captured images, so this is not a controlled FPS
+comparison. Raising the cap alone does not resolve the heavy-scene limit;
+the local default retains the title's 30 FPS setting. The captured final
+seven seconds were inspected, without establishing that all intermittent
+corruption is gone.
