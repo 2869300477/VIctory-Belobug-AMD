@@ -218,7 +218,9 @@ of 27.3 with loading/heavy-scene dips. Peak working set was 15366.5 MiB and
 minimum free physical memory 3144.3 MiB. The upload pool still stabilized
 (12 allocations, two discards); no draw drops or device errors were logged.
 The final part also captured images, so this is not a controlled FPS
-comparison. Raising the cap alone does not resolve the heavy-scene limit;
-the local default retains the title's 30 FPS setting. The captured final
+comparison. Raising the cap alone does not resolve the heavy-scene limit.
+The local default is 60 FPS at the user's request, using
+`VICTORY_FRAME_INTERVAL_MS=16.667` with the matching simulation-step patch;
+subsequent performance runs keep it enabled. The captured final
 seven seconds were inspected, without establishing that all intermittent
 corruption is gone.
