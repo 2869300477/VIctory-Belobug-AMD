@@ -9,7 +9,9 @@ on. Shader and previously used pipeline caches were warm.
 
 ```powershell
 $env:VICTORY_WINDOWS_BAR_MB = '3072'
-$env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
+$env:VICTORY_CARD_BUFFERS_MIN_KB = '128'
+$env:VICTORY_CARD_BUFFERS_MB = '1536'
+$env:VICTORY_STAGING_BLOCK_MB = '16'
 $env:VICTORY_UPSCALER = '6'
 $env:VICTORY_RESIDENCY = '1'
 ```
@@ -31,7 +33,8 @@ Existing allocation budget checks and fallback paths remain enabled.
   improvement and no character problem in that run. This matches the
   same-card report in [issue 279](https://github.com/Belobug/VIctory-Belobug-AMD/issues/279).
 
-With these settings on runtime sources at `c00861d`, a 100-second opening
+With the earlier 1 MiB buffer threshold, default 2048 MiB card-buffer cap
+and 64 MiB upload blocks on runtime sources at `c00861d`, a 100-second opening
 sample had a median of 26.75 FPS across periodic pipeline-ready statistics,
 22327 MiB peak private commit, 16614.5 MiB peak working set and 2212.8 MiB
 minimum free physical memory. Draw and indirect-drop counts were zero.
@@ -89,3 +92,22 @@ The pop watcher now reads Series S's composed back buffer as well as ordinary
 single-texture output. A bounded run produced 1070 local frames. Inspected
 large changes included credits, camera cuts and police lighting; these do
 not identify the intermittent rendering fault reported by the player.
+
+## Smaller buffer comparisons on the GPU
+
+The later local preset uses a 128 KiB threshold and 1536 MiB card-buffer
+cap, following the configuration reported in
+[issue 438](https://github.com/Belobug/VIctory-Belobug-AMD/issues/438).
+With 16 MiB upload blocks and the normal eight recording workers, a
+100-second opening run measured 29.15 median FPS (periodic ready-scene
+statistics), 21838.5 MiB peak private commit, 16385.2 MiB peak working set,
+and 2392.2 MiB minimum free physical memory. CPU comparisons were about
+3.1 MiB/frame, snapshots 2.5 MiB/frame and 0.4 ms/frame. Observed local VRAM
+use was about 10920 MiB against a 14355 MiB budget in one late interval.
+No draw drops, indirect drops or device errors were logged.
+
+The low periodic FPS was still 7.7, so this is not stable 30 FPS. Dynamic
+opening samples and background system use limit comparison precision.
+Separate experiments restoring the runtime's streaming-priority adjustment
+and reducing recording workers to six did not demonstrate a performance
+benefit here and were not added to the local preset.
