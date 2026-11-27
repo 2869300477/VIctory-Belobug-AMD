@@ -113,13 +113,15 @@ thread_local! {
 /// This thread's touches of title memory are the layer's until the result
 /// is dropped.
 pub(crate) fn tag() -> Tag {
-    Tag(TAGGED.with(|t| t.replace(true)))
+    Tag((cfg!(test) || on()).then(|| TAGGED.with(|t| t.replace(true))))
 }
 
-pub(crate) struct Tag(bool);
+pub(crate) struct Tag(Option<bool>);
 impl Drop for Tag {
     fn drop(&mut self) {
-        TAGGED.with(|t| t.set(self.0));
+        if let Some(previous) = self.0 {
+            TAGGED.with(|t| t.set(previous));
+        }
     }
 }
 
@@ -384,14 +386,16 @@ mod tests {
     #[test]
     fn guarded_pages_count_each_touch_once_and_let_it_go_on() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        // SAFETY: fresh pages of our own, freed at the end.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        // Ask below the title-address ceiling so this test exercises the
+        // handler on Windows instead of silently returning for a host VA.
+        let base = [0x6000_0000usize, 0x7000_0000, 0x8000_0000].into_iter().find_map(|at| {
+            // SAFETY: only a free reservation can be returned at this address;
+            // nothing existing is replaced. The test frees its pages below.
+            let made = unsafe { VirtualAlloc(at as _, 4 * PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+            (made != 0).then_some(made)
+        }).unwrap_or(0);
         assert_ne!(base, 0);
-        if base / PAGE + 4 > PAGES {
-            // SAFETY: as above.
-            unsafe { VirtualFree(base as _, 0, MEM_RELEASE) };
-            return;
-        }
+        assert!(base / PAGE + 4 <= PAGES);
         // SAFETY: inside the pages.
         unsafe { (base as *mut u8).write_volatile(7) };
         // Pages 0-2 are the ranges' (page 2 only in part); page 3 is not.

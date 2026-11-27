@@ -34,6 +34,7 @@ $env:VICTORY_SEND_SPARE_MB = '256'
 $env:VICTORY_FRAME_INTERVAL_MS = '16.667'
 $env:VICTORY_UPSCALER = '6'
 $env:VICTORY_RESIDENCY = '1'
+$env:VICTORY_WC_NO_BACK = '1'
 ```
 
 These local settings do not change the runtime's global defaults.
@@ -273,3 +274,37 @@ was 584.3 MiB. Median periodic FPS stayed 22.6; no draw drops or device errors
 were logged. This directly confirms placement of more windows in VRAM,
 not a precise net physical-RAM saving or a frame-rate improvement. System
 memory pressure remains substantial.
+
+## Selective copy-back experiment
+
+The seven commits of upstream PR 477 (`0834177`, including PR 476's
+protection statistics) were ported with author attribution. The opt-in
+`VICTORY_WC_NO_BACK=1` leaves shader writes on card-backed, write-watched
+copies of write-combined title memory, for declarations at least 64 KiB.
+Other declarations retain ordinary copy-back. The native default remains
+off; the local development preset selects it, with `-FullCopyBack` available
+to restore the prior behavior. `VICTORY_WC_KEEP_STORES` remains off.
+
+Before validation, the endpoint-only protection check was replaced with
+full interval coverage, rejecting cached interiors, holes and address
+overflow. Disabled census tags avoid TLS writes. Its page-guard test now
+requests a free low address, so Windows cannot skip it merely because an
+unconstrained allocation lies above the title's address ceiling. Five
+range/protection checks and the real guard-handler check passed; the
+diagnostic executable built successfully. No full suite was run.
+
+An 85-second Series X opening with the access census and late image capture
+had a periodic median of 28.0 FPS (3.9–49.2), no draw drops and no device
+errors. Copy-back fell to about 0.2 MiB/frame and 1–2 ms in reported intervals,
+versus tens of MiB and over 20 ms in the prior run. The census tracked about
+639 MiB of ranges and recorded zero untagged page reads; title writes were
+recorded. Final captured frames showed no obvious recurrence of the earlier
+black patches. Peak private commit remained 26508.3 MiB, peak working set
+17657.4 MiB, and minimum free RAM 511.4 MiB.
+
+This is a development experiment: the dynamic scene, longer sample,
+census and capture prevent a controlled FPS claim. Page guards observe the
+first access between armings and do not cover every possible read or alias.
+Write-combined protection itself does not prohibit CPU reads; no claim is
+made that this optimization is correct for every scene. Normal local play
+keeps the census off. Memory pressure and loading stalls remain unresolved.

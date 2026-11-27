@@ -4069,7 +4069,7 @@ impl Shadow {
         // Ranges the card keeps (`VICTORY_WC_NO_BACK`): left out where the
         // write watch cannot say which pages the CPU wrote, so a whole copy
         // would put the title's old bytes over what shaders wrote.
-        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+        if crate::wc::no_back() && !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             let owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
             if !owned.is_empty() {
                 let before = busy.len();

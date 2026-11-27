@@ -114,7 +114,7 @@ pub(crate) fn skip_back(address: usize, len: usize, carded: bool, watched: bool)
     if !no_back() || len == 0 {
         return false;
     }
-    let wc = kind(address) == Kind::WriteCombined && kind(address + len - 1) == Kind::WriteCombined;
+    let wc = covered_by(&ranges().read().unwrap_or_else(|e| e.into_inner()), address, len, Kind::WriteCombined);
     if !wc {
         return false;
     }
@@ -258,6 +258,24 @@ pub(crate) fn kind(address: usize) -> Kind {
     }
 }
 
+/// Both ends having one kind does not establish the interior's protection:
+/// a newer allocation or protection can cut a cached interval into it.
+fn covered_by(map: &BTreeMap<usize, (usize, Kind)>, from: usize, len: usize, wanted: Kind) -> bool {
+    let Some(to) = from.checked_add(len).filter(|&to| to > from) else { return false };
+    let Some((&first, _)) = map.range(..=from).next_back() else { return false };
+    let mut covered = from;
+    for (&start, &(end, kind)) in map.range(first..to) {
+        if start > covered || end <= covered || kind != wanted {
+            return false;
+        }
+        covered = end;
+        if covered >= to {
+            return true;
+        }
+    }
+    false
+}
+
 /// Bytes copied up to the card (refreshes, copies, fills), by kind, and
 /// what of them were counted.
 static UP: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
@@ -338,6 +356,22 @@ pub(crate) fn log(sample: Sample) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_card_owned_range_must_have_one_kind_throughout() {
+        let mut map = BTreeMap::new();
+        insert(&mut map, 0x1000, 0x9000, Kind::WriteCombined);
+        assert!(covered_by(&map, 0x1000, 0x8000, Kind::WriteCombined));
+        insert(&mut map, 0x3000, 0x5000, Kind::Cached);
+        assert!(!covered_by(&map, 0x2000, 0x6000, Kind::WriteCombined));
+        assert!(covered_by(&map, 0x5000, 0x4000, Kind::WriteCombined));
+        insert(&mut map, 0x3000, 0x5000, Kind::WriteCombined);
+        assert!(covered_by(&map, 0x1000, 0x8000, Kind::WriteCombined));
+        map.remove(&0x3000);
+        assert!(!covered_by(&map, 0x2000, 0x6000, Kind::WriteCombined));
+        assert!(!covered_by(&map, usize::MAX - 1, 2, Kind::WriteCombined));
+        assert!(!covered_by(&map, 0x1000, 0, Kind::WriteCombined));
+    }
 
     #[test]
     fn newest_protection_wins_and_cuts_older_ranges() {
