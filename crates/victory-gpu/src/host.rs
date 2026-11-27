@@ -9870,8 +9870,21 @@ impl Host {
                 crate::capture::probe(&self.device, list, texture)
             };
             #[cfg(feature = "diagnostics")]
-            let watched = if composed {
+            let watched = if !crate::popwatch::on() {
                 None
+            } else if composed {
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let taken = crate::popwatch::take(&self.device, list, &back);
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                taken
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
