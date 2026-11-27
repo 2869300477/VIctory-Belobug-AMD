@@ -111,3 +111,19 @@ opening samples and background system use limit comparison precision.
 Separate experiments restoring the runtime's streaming-priority adjustment
 and reducing recording workers to six did not demonstrate a performance
 benefit here and were not added to the local preset.
+
+## Intermittent dark patches: captured, not fixed
+
+Following the player's timing hint, capture was extended through the end
+of the opening sample. Consecutive frames confirmed irregular black patches
+on characters and occasional background loss followed by recovery. Earlier
+captures had ended before this interval. These are distinct from the hair
+noise improved by the reconstruction setting.
+
+Three separate diagnostic runs retained the patches: all title buffers with
+two sides (`VICTORY_CARD_ALL=1`), table constants copied at submission
+(`VICTORY_PORT_CBV_PLACE=0`), and the graphics heap copied/synchronized
+instead of mapped in place (`VICTORY_PORT_CONSTANTS=0`). None is added to the
+local preset as a fix. This does not rule out other synchronization or
+shader faults; it rules out each of these switches as a sufficient remedy.
+Captured images and logs remain outside the repository.
