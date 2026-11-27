@@ -127,3 +127,34 @@ instead of mapped in place (`VICTORY_PORT_CONSTANTS=0`). None is added to the
 local preset as a fix. This does not rule out other synchronization or
 shader faults; it rules out each of these switches as a sufficient remedy.
 Captured images and logs remain outside the repository.
+
+## Raw twins in the descriptor cache
+
+The failing interval logged approximately 250–290 null raw twins per frame.
+[Upstream PR 437](https://github.com/avatarmanz/VIctory-7900XTX/pull/437)
+identified the same class of null view as a cause of foliage flicker on
+Linux/RADV. Its direct unaligned-view creation was not adopted here.
+
+The native Windows implementation already corrects a raw twin's address in
+a thread's staging slot, after checking that the driver's descriptor bytes
+match the expected GPU address and length. The recording cache constructed
+views in its own slots, so they failed the staging-slot check and became
+null whenever relocation was needed. Cache misses now build buffer views
+through the existing staging path and copy the corrected pair into the
+CPU-only cache. Hits retain the cached descriptors. The existing guard and
+unsupported-driver fallback are unchanged; shader translation is unchanged.
+
+The opt-in native AMD regression test
+`cached_raw_twins_keep_the_typed_views_exact_byte_start` failed before the
+change: a view starting at byte 4 became `(0, 0)` in the cache although the
+ordinary descriptor had `(GPU address + 4, 64 bytes)`. It passes after the
+change for byte offsets 4/8/12 and halfword offsets 2/6, on cache misses and
+hits. This checks native descriptor contents, not a cross-vendor rendering
+guarantee. Runtime visual validation is recorded separately.
+
+The native run after this fix reported zero null twins throughout, including
+about 310 misaligned twins/frame at the end. It captured 785 frames and
+still showed intermittent character patches: the null-twin defect is fixed,
+but it was not the only visual problem. The 110-second opening's periodic
+median was 28.8 FPS, with no draw drops or logged device errors. Capture
+overhead and the changing scene prevent an isolated performance claim.

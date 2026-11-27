@@ -2842,7 +2842,24 @@ impl HostHeap {
                         return None;
                     }
                     let twin = twinned(&view);
-                    let kept = make_twinned(&view, slot(at), Some(slot(at + 1)))?;
+                    let kept = if twin {
+                        // Raw twins off 16 bytes can only be relocated in
+                        // this thread's staging slot. Creating them directly
+                        // in the cache made those views null, unlike the
+                        // ordinary path. Cache the already corrected pair.
+                        let (normal, raw) = (staged(false, 0)?, staged(false, 1)?);
+                        let kept = make_twinned(&view, normal, Some(raw))?;
+                        let host = host()?;
+                        // SAFETY: this thread owns both staging slots and
+                        // both destination slots in its CPU-only cache.
+                        unsafe {
+                            host.device.CopyDescriptorsSimple(1, slot(at), normal, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                            host.device.CopyDescriptorsSimple(1, slot(at + 1), raw, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                        }
+                        kept
+                    } else {
+                        make_twinned(&view, slot(at), None)?
+                    };
                     let listed = Listed {
                         kind: crate::draw::view_kind(&view),
                         texture: is_texture_view(&view),
@@ -5548,6 +5565,50 @@ mod tests {
         } else {
             assert_eq!(words(), before);
         }
+    }
+
+    /// Native AMD staging relocation must also survive the recording cache.
+    #[test]
+    #[ignore = "requires native AMD raw descriptor relocation"]
+    fn cached_raw_twins_keep_the_typed_views_exact_byte_start() {
+        let host = host().expect("native host GPU");
+        let heap = HostHeap::new(false, 4).expect("descriptor heap");
+        let memory = vec![0u32; 1 << 14];
+        let address = (memory.as_ptr() as u64).next_multiple_of(4096);
+        crate::shadow::register(address as usize, address, 4096);
+        let shadow = crate::shadow::find(address, 4096).expect("backing copy");
+        let gpu = shadow.gpu(address);
+        let raw_words = |at: D3D12_CPU_DESCRIPTOR_HANDLE| {
+            let mut bytes = [0u8; 12];
+            assert!(crate::host::read_into(at.ptr as *const u8, &mut bytes));
+            (u64::from_le_bytes(bytes[..8].try_into().unwrap()), u32::from_le_bytes(bytes[8..].try_into().unwrap()))
+        };
+        for (format, element, first) in [(42, 4, 1), (42, 4, 2), (42, 4, 3), (57, 2, 1), (57, 2, 3)] {
+            let resource = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[format, 1, 5768, 0, first, 0, 16, 0, 0, 0]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            let view = View::Placed(false, resource, desc);
+            let [i, generation] = crate::descriptor::words_for(view.clone());
+            let words = [VIEW_TAG, i, generation];
+            let byte = u64::from(first * element);
+            let expected = (gpu + byte, (first * element + 16 * element).next_multiple_of(4) - first * element);
+            let normal = staged(false, 0).unwrap();
+            let twin = staged(false, 1).unwrap();
+            let kept = make_twinned(&view, normal, Some(twin)).expect("ordinary path");
+            assert_eq!(raw_words(twin), expected, "native relocation must work on this adapter");
+            // A miss and a hit in the recording's cache must show precisely
+            // the same bytes as the ordinary path, including halfword starts.
+            for _ in 0..2 {
+                let slot = heap.dynamic(1).unwrap();
+                heap.make_listed(u64::MAX - 1, words, slot).expect("cached view");
+                assert_eq!(raw_words(heap.cpu(heap.raw + slot)), expected, "cached twin at byte {byte}");
+            }
+            drop(kept);
+        }
+        crate::shadow::unregister(address as usize, address);
+        // SAFETY: a plain query on the live device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Views that begin where no host view can: raw ones off 16 bytes,
