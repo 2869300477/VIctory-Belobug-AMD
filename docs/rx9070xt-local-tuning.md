@@ -447,3 +447,54 @@ checks were taken. A prior 20-second command-timing run (`223804`) forced
 synchronous execution and was used only to locate GPU costs: the noted
 commands totaled about 21–23 ms/frame in heavier samples, spread across
 many dispatches and indirect executions, with no single dominant shader.
+
+## Experiments after native FP16
+
+The main display was queried again as 2560×1440 at 200 Hz. Run `225210`
+asked for 2560×1440 output with the title's render scale set to 1.0, keeping
+Series X and 60 FPS. The loader applied all three relevant resolution/scale
+patches and the initial presentation was 2560×1440. A 4K viewport still
+appeared later, so the viewport set alone cannot establish each pass's size.
+The 45-second run had median periodic 30.3 FPS, peak private commit
+22942.4 MiB, working set 15860.1 MiB, and minimum free RAM 2458.0 MiB.
+Heavy GPU work remained around 27 ms; no gain was established. The normal
+output preset was kept.
+
+Run `225616` used the existing 20-second on/off phases of `CARD_AWAKE` in
+one 45-second scene sample. After excluding the first three seconds of
+each phase and samples below 20 ms GPU work, off had 17 samples at median
+27.7 / mean 27.26 ms and on had 12 at 28.8 / 27.65 ms. These different
+shots do not establish a useful causal gain. Normal play keeps awake on.
+Neither experiment logged dropped work or device errors.
+
+A cached-descriptor copy experiment gathered normal views and raw twins
+into contiguous destination runs of up to 64 descriptors per native
+`CopyDescriptors` call. A native byte-content/resource-retention parity
+test passed in 0.25 seconds, including cache-generation rollover, fallback
+nulls and misaligned raw twins. Run `230437` reduced roughly 100000 cached
+slot-copy calls to about 15000 calls per frame, but did not demonstrate
+less recording time: selected world samples averaged 5.59 microseconds
+per translated call versus 5.50 previously. Periodic FPS median was 26.8,
+peak commit 22806.4 MiB, working set 15446.9 MiB, and minimum free RAM
+2658.2 MiB; no drops or device errors. It was removed and saved as a local
+research patch. No changes to descriptor lifetime were retained.
+
+## Sparse CPU-mapped VRAM feasibility
+
+An explicit native probe reserves a 64 MiB buffer but supplies only two
+64 KiB tiles from a GPU_UPLOAD heap. A CPU-mapped placed alias writes those
+tiles; the reserved buffer exposes them at tile offsets 2 and 510. The GPU
+copies both values back and the test checks the D3D12 debug messages.
+On this RX 9070 XT, the probe passed in 0.09 seconds. Process private commit
+grew by 1.67 MiB in the final probe, including command/driver objects; this
+is not a physical-RAM or game-performance measurement. The explicitly
+created physical tile heap was 128 KiB, versus 64 MiB of virtual buffer.
+
+This establishes the hardware primitive for sparse window copies without
+a second RAM mirror. It is not yet the runtime window allocator. Integration
+must preserve the GPU buffer address as new tiles are added, zero newly
+assigned tiles, retain each tile until the last resource reference and GPU
+use are finished, and cover every range shaders may write. CPU copies and
+read-back currently assume one contiguous mapping and must be adapted to
+page mappings before this can be used by normal play. No screenshot or
+visual check was part of these experiments.

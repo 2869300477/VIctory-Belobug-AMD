@@ -972,6 +972,94 @@ mod driver_memory_tests {
         report("8 texture heaps of 64 MiB", &before, private);
         drop(heaps);
     }
+
+    /// Feasibility probe for sparse windows without a second RAM mirror:
+    /// a CPU-mapped GPU_UPLOAD heap supplies selected tiles of a reserved
+    /// buffer. A placed alias writes those physical tiles through the BAR.
+    #[test]
+    #[ignore = "native sparse GPU_UPLOAD capability probe; no game required"]
+    fn sparse_gpu_upload_tiles_keep_cpu_writes_at_reserved_offsets() {
+        use windows::core::Interface;
+        let host = crate::host::host().expect("native GPU");
+        assert!(host.mapped_card_memory(), "GPU_UPLOAD required");
+        const TILE: u64 = 64 << 10;
+        let before = allocations();
+        let private = super::process_memory().1;
+        // SAFETY: ordinary resources, kept alive until the private queue
+        // fence completes; CPU writes happen before the command submission.
+        unsafe {
+            let desc = |bytes| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            host.device.CreateHeap(&D3D12_HEAP_DESC {
+                SizeInBytes: 2 * TILE,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() },
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                ..Default::default()
+            }, &mut heap).expect("GPU_UPLOAD tile heap");
+            let heap = heap.unwrap();
+            let mut alias: Option<ID3D12Resource> = None;
+            host.device.CreatePlacedResource(&heap, 0, &desc(2 * TILE), D3D12_RESOURCE_STATE_COMMON,
+                None, &mut alias).expect("CPU-writable tile alias");
+            let alias = alias.unwrap();
+            let mut data = std::ptr::null_mut();
+            alias.Map(0, None, Some(&mut data)).expect("map tile alias");
+            data.cast::<u32>().write(17);
+            data.cast::<u8>().add(TILE as usize).cast::<u32>().write(29);
+            let mut reserved: Option<ID3D12Resource> = None;
+            let made = host.device.CreateReservedResource(&desc(64 << 20), D3D12_RESOURCE_STATE_COMMON,
+                None, &mut reserved);
+            if let Err(e) = made {
+                let messages = host.log_messages();
+                panic!("reserved buffer refused: {e}; {messages:?}");
+            }
+            let reserved = reserved.unwrap();
+            let queue: ID3D12CommandQueue = host.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default()
+            }).unwrap();
+            let coords = [2u32, 510].map(|x| D3D12_TILED_RESOURCE_COORDINATE { X: x, ..Default::default() });
+            let sizes = [D3D12_TILE_REGION_SIZE { NumTiles: 1, ..Default::default() }; 2];
+            queue.UpdateTileMappings(&reserved, 2, Some(coords.as_ptr()), Some(sizes.as_ptr()), &heap,
+                1, Some(&D3D12_TILE_RANGE_FLAG_NONE), Some(&0), Some(&2), D3D12_TILE_MAPPING_FLAG_NONE);
+            if let Some(message) = host.log_messages() {
+                panic!("GPU_UPLOAD tile mapping refused: {message}");
+            }
+            let back = host.read_back_buffer(256).unwrap();
+            let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    // Borrowed interface pointers; ResourceBarrier does not
+                    // retain them and ManuallyDrop must not leak an AddRef.
+                    pResourceBefore: std::mem::ManuallyDrop::new(Some(std::ptr::read(&alias))),
+                    pResourceAfter: std::mem::ManuallyDrop::new(Some(std::ptr::read(&reserved))),
+                }) },
+            }]);
+            list.CopyBufferRegion(&back, 0, &reserved, 2 * TILE, 4);
+            list.CopyBufferRegion(&back, 4, &reserved, 510 * TILE, 4);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let done: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&done, 1).unwrap();
+            done.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+            let mut seen = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut seen)).unwrap();
+            assert_eq!(std::slice::from_raw_parts(seen.cast::<u32>(), 2), [17, 29]);
+            back.Unmap(0, None);
+            alias.Unmap(0, None);
+            assert_eq!(host.log_messages(), None, "D3D12 rejected sparse BAR storage");
+            report("64 MiB reserved buffer with 128 KiB BAR backing", &before, private);
+        }
+    }
 }
 
 /// Logs where the memory is: the process and the PC, then what this crate
