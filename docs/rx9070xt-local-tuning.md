@@ -13,6 +13,15 @@ is retained; the default 2/3 scale implies roughly 2560x1440 internal
 rendering, rather than native 4K. The original Series S comparisons below
 do not establish performance or memory use for this higher-quality mode.
 
+The first 45-second Series X scene sample recorded a periodic median of
+22.6 FPS (11.0–46.5), peak private commit 25853.5 MiB, peak working set
+16497.3 MiB, and minimum free physical memory 383.0 MiB. It logged no
+draw/indirect drops or device errors. The player reported that the locations
+which had flickered before no longer did in this run. This is a visual
+improvement observed with the new preset, not an identified root-cause fix
+or proof for all scenes. Series X, title reconstruction and 60 FPS remain
+the local defaults; memory pressure and heavy-scene FPS remain open.
+
 ## Retained settings
 
 ```powershell
