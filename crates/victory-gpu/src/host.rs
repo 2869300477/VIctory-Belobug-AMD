@@ -42,6 +42,7 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    state_preludes: prelude_pool::Pool,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -1108,6 +1109,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            state_preludes: prelude_pool::Pool::default(),
             event,
             rtvs,
             rtv_size,
@@ -1348,7 +1350,7 @@ pub(crate) struct HostList {
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    prelude: OnceLock<Option<StatePrelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1389,6 +1391,12 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+struct StatePrelude {
+    /// None with the optional allocator shared by this submission's preludes.
+    private: Option<ID3D12CommandAllocator>,
+    list: ID3D12GraphicsCommandList,
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -3900,6 +3908,7 @@ mod card_steps;
 pub(crate) mod indirects;
 mod panel;
 mod place;
+mod prelude_pool;
 pub(crate) mod rec;
 mod send;
 mod upq;
@@ -4270,6 +4279,29 @@ impl Host {
         }
     }
 
+    fn make_state_prelude(&self, shared: Option<&ID3D12CommandAllocator>) -> Option<StatePrelude> {
+        let Some(allocator) = shared else {
+            return self.make_prelude().map(|(allocator, list)| StatePrelude { private: Some(allocator), list });
+        };
+        // SAFETY: no other list is recording into this submission's allocator;
+        // each preceding state prelude was closed before this one begins.
+        let made = unsafe {
+            let made: windows::core::Result<ID3D12GraphicsCommandList> =
+                self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, None);
+            made.and_then(|list| { list.Close()?; Ok(list) })
+        };
+        match made {
+            Ok(list) => {
+                LISTS[1].fetch_add(1, Ordering::Relaxed);
+                Some(StatePrelude { private: None, list })
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no state prelude with a submission allocator");
+                None
+            }
+        }
+    }
+
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
@@ -4283,8 +4315,8 @@ impl Host {
                 None,
             )?;
             let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+            if !lazy_prelude() && !prelude_pool::on() {
+                let _ = prelude.set(self.make_state_prelude(None));
             }
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
@@ -5813,6 +5845,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut prelude_batch = None;
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         // Diagnostics: where each list of `lists` starts and what it is, for
@@ -5886,7 +5919,7 @@ impl Host {
         for (_run, list) in runs.iter().enumerate() {
             let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            if let Some(prelude) = list.prelude(&uploads, &mut prelude_batch) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
@@ -6012,6 +6045,9 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            if let Some(batch) = prelude_batch.take() {
+                self.state_preludes.submitted(batch, *submitted);
+            }
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -6111,6 +6147,9 @@ impl Host {
                 }
             }
             let _ = (_i, started);
+        }
+        if let Some(batch) = prelude_batch.take() {
+            self.state_preludes.submitted(batch, *submitted);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -6934,7 +6973,7 @@ impl HostList {
     /// from the other, if a list submitted earlier left it behind. For
     /// title-written textures refreshed on this submission (`uploads`), it
     /// records `CopyTextureRegion` right before the list runs.
-    fn prelude(&self, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<ID3D12CommandList> {
+    fn prelude(&self, uploads: &[(crate::texture::PreludeUpload, bool)], batch: &mut Option<prelude_pool::Batch>) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7036,17 +7075,27 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
+        let host = host()?;
+        if prelude_pool::on() && batch.is_none() {
+            // SAFETY: the fence belongs to this Host and follows its direct queue.
+            let completed = unsafe { host.fence.GetCompletedValue() };
+            *batch = Some(host.state_preludes.take(&host.device, completed)
+                .unwrap_or_else(|e| fail(format_args!("no completed prelude allocator ({e})"))));
+        }
+        let shared = batch.as_ref().map(|b| &b.allocator);
+        let Some(prelude) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host.make_state_prelude(shared))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        let allocator = prelude.private.as_ref().or(shared).expect("state prelude allocator");
+        let list = &prelude.list;
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
+            prelude.private.as_ref().map_or(Ok(()), |private| private.Reset()).and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !aliasing.is_empty() {
                     list.ResourceBarrier(&aliasing);
@@ -10154,6 +10203,7 @@ impl Host {
 
     /// Logs [`Self::video_memory_groups`], with `when` it is said.
     pub(crate) fn log_video_memory(&self, when: &str) {
+        self.state_preludes.log();
         let Some([own, shared]) = self.video_memory_groups() else {
             return;
         };

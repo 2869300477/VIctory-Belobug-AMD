@@ -868,6 +868,112 @@ fn log_memory_map() {
     log_memory_owners(&regions, &whole);
 }
 
+#[cfg(test)]
+mod driver_memory_tests {
+    use std::collections::BTreeMap;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    // An isolated census, not a game benchmark: report new committed
+    // allocations after one D3D12 allocation class at a time.
+    fn allocations() -> BTreeMap<usize, (usize, u32)> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let mut out: BTreeMap<usize, (usize, u32)> = BTreeMap::new();
+        let mut at = 0usize;
+        loop {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a query of this process; a correctly sized output.
+            if unsafe { VirtualQuery(at as _, &mut info, size_of_val(&info)) } == 0 { break; }
+            if info.State == MEM_COMMIT {
+                let a = out.entry(info.AllocationBase as usize).or_default();
+                a.0 += info.RegionSize;
+                a.1 |= info.Protect;
+            }
+            let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            if next <= at { break; }
+            at = next;
+        }
+        out
+    }
+
+    fn report(label: &str, before: &BTreeMap<usize, (usize, u32)>, private_before: u64) {
+        let mut groups: BTreeMap<(usize, u32), usize> = BTreeMap::new();
+        for (base, (bytes, protect)) in allocations() {
+            let old = before.get(&base).map_or(0, |v| v.0);
+            if bytes > old {
+                *groups.entry((bytes - old, protect)).or_default() += 1;
+            }
+        }
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        groups.sort_by_key(|((bytes, _), count)| std::cmp::Reverse(bytes * count));
+        println!("{label}: private delta {:.2} MiB; committed growth by allocation: {}",
+            (super::process_memory().1 as i64 - private_before as i64) as f64 / (1 << 20) as f64,
+            groups.into_iter().take(8).map(|((bytes, protect), count)| format!("{count} x {:.2} MiB protect={protect:#x}", bytes as f64 / (1 << 20) as f64)).collect::<Vec<_>>().join("; "));
+    }
+
+    #[test]
+    #[ignore = "native driver allocation census; run explicitly without a game"]
+    fn attribute_large_native_allocations() {
+        let host = crate::host::host().expect("native device");
+        let before = allocations();
+        let private = super::process_memory().1;
+        let mut lists = Vec::new();
+        for _ in 0..256 {
+            // SAFETY: ordinary live device objects, released together.
+            let allocator: ID3D12CommandAllocator = unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+            let list: ID3D12GraphicsCommandList = unsafe { host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None) }.unwrap();
+            // No submission; a global UAV barrier is a legal recorded command.
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER::default()) },
+            };
+            unsafe {
+                for _ in 0..64 { list.ResourceBarrier(std::slice::from_ref(&barrier)); }
+                list.Close().unwrap();
+            }
+            lists.push((allocator, list));
+        }
+        report("256 recorded allocators/lists", &before, private);
+        drop(lists);
+        for kind in ["upload", "shared", "mapped-card"] {
+            let before = allocations();
+            let private = super::process_memory().1;
+            let mut buffers = Vec::new();
+            for _ in 0..128 {
+                let (buffer, data) = match kind {
+                    "upload" => host.upload_buffer(4 << 20),
+                    "shared" => host.shared_buffer(4 << 20),
+                    _ => host.mapped_card_buffer(4 << 20, true),
+                }.expect("mapped buffer");
+                // Touch one page, without forcing reads from a BAR mapping.
+                unsafe { std::ptr::write_bytes(data, 0, 4096) };
+                buffers.push(buffer);
+            }
+            report(kind, &before, private);
+            drop(buffers);
+        }
+        let before = allocations();
+        let private = super::process_memory().1;
+        let mut heaps = Vec::new();
+        for _ in 0..8 {
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: ordinary native texture heap with the runtime's flags.
+            unsafe { host.device.CreateHeap(&D3D12_HEAP_DESC {
+                SizeInBytes: 64 << 20,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+                ..Default::default()
+            }, &mut heap) }.unwrap();
+            let heap = heap.unwrap();
+            crate::host::resident(&host.device, &heap).unwrap();
+            crate::host::mapped(&host.device).unwrap();
+            heaps.push(heap);
+        }
+        report("8 texture heaps of 64 MiB", &before, private);
+        drop(heaps);
+    }
+}
+
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {

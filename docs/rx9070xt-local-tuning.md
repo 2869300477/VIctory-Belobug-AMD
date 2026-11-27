@@ -35,6 +35,7 @@ $env:VICTORY_FRAME_INTERVAL_MS = '16.667'
 $env:VICTORY_UPSCALER = '6'
 $env:VICTORY_RESIDENCY = '1'
 $env:VICTORY_WC_NO_BACK = '1'
+$env:VICTORY_SHARED_PRELUDE_ALLOCATORS = '1'
 ```
 
 These local settings do not change the runtime's global defaults.
@@ -308,3 +309,38 @@ first access between armings and do not cover every possible read or alias.
 Write-combined protection itself does not prohibit CPU reads; no claim is
 made that this optimization is correct for every scene. Normal local play
 keeps the census off. Memory pressure and loading stalls remain unresolved.
+
+## Shared state-prelude allocators
+
+An isolated native allocation census found about 298.5 MiB of additional
+private commit for 256 separately allocated command allocators/lists, each
+recording 64 barriers. These created the same 32 MiB write-combined driver
+allocation groups seen in the game. Eight texture heaps of 64 MiB produced
+about 513 MiB of commit, accounting for another distinct size group. The
+census is an ignored diagnostic, not a game benchmark or a unique-RAM measure.
+
+`VICTORY_SHARED_PRELUDE_ALLOCATORS=1` gives the serially recorded state
+preludes in one host submission a shared command allocator. The host retains
+the allocator behind the direct queue's actual fence value, and resets it
+only once that signal is complete. Every prelude still occupies its original
+position before its title list, with its existing transitions and uploads.
+Main recording allocators and the relay/check lists keep their ownership.
+The native default is off; the local preset enables it, with
+`-PrivatePreludeAllocators` restoring the prior state-prelude allocation.
+
+A focused native test held the queue behind an unsignaled fence, verified
+that an unfinished allocator was not reused, released the gate, and checked
+reuse and the copy results of multiple lists. It also rejects the fence's
+device-removed sentinel. The diagnostic build and a 45-second Series X
+scene run passed, with zero draw/indirect drops and no device errors.
+
+The run's shared pool stabilized at 17 allocators, reused 21,942 times by
+the last memory report. Peak private commit was 23746.4 MiB, peak working
+set 16610.9 MiB, minimum free RAM 1876.5 MiB, and periodic median 31.5 FPS
+(10.4–47.9). The preceding ordinary-buffer-residency experiment used
+25305.7 MiB peak commit, 17664.9 MiB peak working set, minimum free RAM
+620.1 MiB and median 30.5 FPS. That residency experiment did not reduce the
+large allocation groups and was removed. These dynamic runs are not a
+controlled FPS estimate; the allocator count and lower memory requirement
+support retaining the shared-prelude change. No screenshots or flicker
+checks were made, following the player's request.
