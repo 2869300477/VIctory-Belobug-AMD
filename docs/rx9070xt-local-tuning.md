@@ -407,3 +407,43 @@ reported roughly 26–28 ms in heavy shots. Its periodic median was 32.7 FPS
 and peak commit 23466.0 MiB; differing diagnostic overhead and the dynamic
 scene prevent a causal FPS claim. Normal Play keeps DRED Light. Actual
 viewport diagnostics observed 2560×1440 scene rendering and 3840×2160 output.
+
+## Native FP16 translation experiment
+
+Upstream [PR 502](https://github.com/Belobug/VIctory-Belobug-AMD/pull/502),
+commit `37b25cc`, was ported with its original author attribution. It emits
+native DXIL half arithmetic for supported console FP16 operations, replacing
+repeated FP16-to-FP32 arithmetic and conversion back. The device must report
+native 16-bit operations and pass a single-rounding FMA probe. Unsupported
+operations retain the existing path, and shader cache keys distinguish the
+two forms. This remains a development experiment: this translator does not
+model console MODE rounding, and a startup probe cannot establish every
+shader's behavior. Local Play uses the supported native path; `-F16InF32`
+restores the previous arithmetic and its existing shader cache.
+
+On the RX 9070 XT, the native-operation query and single-rounding probe both
+passed. Five focused tests passed: arithmetic against an exact FP16 model,
+zeros/NaNs/clamp, emitted feature flags, translation fingerprint, and the
+unsupported-host fallback/probe. The two numerical tests took 5.29 seconds;
+the remaining tests took 0.12 seconds together. No tests were skipped for
+lack of hardware. The diagnostic build and asset policy passed.
+
+Only pipelines previously used by draws were warmed: 2091 of 83596 known
+entries, in 49 seconds with four workers. All produced host pipelines and
+no worker crashed. The new 45-second Series X / 60 FPS run (`224454`)
+confirmed `native16=true`, preserved title reconstruction, and included
+submission GPU timestamps. Its periodic median was 30.8 FPS (22.5–39.3),
+peak private commit 22808.3 MiB, peak working set 15908.4 MiB, and minimum
+free RAM 2357.8 MiB. There were no draw/indirect drops or device errors.
+The automatic player confirmation pressed at 10007 ms and released at
+11004 ms after the window became ready.
+
+Heavy-shot GPU work still measured approximately 26–30 ms. The preceding
+shared-allocator run had median 29.3 FPS without these timestamp diagnostics;
+this comparison does not establish a native-FP16 performance gain. The
+experiment is retained as a reversible hardware-native translation path,
+not a claim of 60 FPS or validation of every scene. No images or flicker
+checks were taken. A prior 20-second command-timing run (`223804`) forced
+synchronous execution and was used only to locate GPU costs: the noted
+commands totaled about 21–23 ms/frame in heavier samples, spread across
+many dispatches and indirect executions, with no single dominant shader.
