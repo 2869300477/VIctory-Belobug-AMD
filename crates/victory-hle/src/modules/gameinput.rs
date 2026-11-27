@@ -1592,9 +1592,15 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `VICTORY_KEYS_AFTER_WINDOW=1` starts the clock when the presenter's
+    /// visible window is ready instead; no scripted keys before that.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        static AFTER_WINDOW: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("VICTORY_KEYS_AFTER_WINDOW").is_some_and(|v| v == "1")
+        });
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8, AtomicU8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
@@ -1617,15 +1623,33 @@ mod host {
                     Some((from, to)) => (time(from)?, time(to)?),
                     None => (time(at)?, time(at)? + Duration::from_millis(200)),
                 };
-                Some((from, to, vk))
+                Some((from, to, vk, AtomicU8::new(0)))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
+        let now = if *AFTER_WINDOW {
+            let Some(age) = victory_gpu::frame::window_age() else { return Vec::new() };
+            age
+        } else {
+            start.elapsed()
+        };
         keys.iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
+            .filter_map(|(from, to, vk, state)| {
+                let phase = if now < *from { 0 } else if now < *to { 1 } else { 2 };
+                if state.load(Relaxed) < phase {
+                    let before = state.fetch_max(phase, Relaxed);
+                    if before < phase {
+                        let elapsed_ms = now.as_millis() as u64;
+                        match (before, phase) {
+                            (_, 1) => tracing::info!(key = *vk, elapsed_ms, window_clock = *AFTER_WINDOW, "scripted key pressed"),
+                            (1, 2) => tracing::info!(key = *vk, elapsed_ms, window_clock = *AFTER_WINDOW, "scripted key released"),
+                            _ => tracing::warn!(key = *vk, elapsed_ms, "scripted key interval missed: no input poll during the hold"),
+                        }
+                    }
+                }
+                (phase == 1).then_some(*vk)
+            })
             .collect()
     }
 

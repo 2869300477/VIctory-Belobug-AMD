@@ -9959,6 +9959,8 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        #[cfg(feature = "diagnostics")]
+        crate::frame::window_ready();
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {

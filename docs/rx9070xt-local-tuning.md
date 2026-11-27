@@ -158,3 +158,17 @@ still showed intermittent character patches: the null-twin defect is fixed,
 but it was not the only visual problem. The 110-second opening's periodic
 median was 28.8 FPS, with no draw drops or logged device errors. Capture
 overhead and the changing scene prevent an isolated performance claim.
+
+## Unattended local startup
+
+The local launchers use `VICTORY_KEYS_AFTER_WINDOW=1` with
+`VICTORY_KEYS=10-11:Enter`: wait ten seconds after the visible presentation
+window is available, then hold Enter/the mapped gamepad A button for one
+second. The input hook logs pressed, released, or a missed interval. This
+is diagnostic-build functionality. Without the new window-clock flag,
+existing scripts retain their input-start clock.
+
+A native startup logged the press at 10003 ms and release at 11005 ms from
+window readiness and entered the story without manual input. The window
+clock does not establish that an arbitrary title's menu is ready; the logs
+make input delivery timing inspectable if a later build loads differently.

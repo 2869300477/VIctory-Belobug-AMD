@@ -63,6 +63,26 @@ struct Clock {
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(all(windows, feature = "diagnostics"))]
+static WINDOW_READY: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Starts diagnostics' window-relative input clock once a visible window
+/// is available to the presenter. Recreating a presenter does not replay keys.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn window_ready() {
+    WINDOW_READY.get_or_init(|| {
+        tracing::info!("visible game window ready; window-relative input clock started");
+        Instant::now()
+    });
+}
+
+/// Time since the presenter's visible window became available, for scripted
+/// input that must not expire during loading before a window exists.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn window_age() -> Option<Duration> {
+    WINDOW_READY.get().map(Instant::elapsed)
+}
+
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
